@@ -1,0 +1,7 @@
+# Backend Git Ignore
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.pytest_cache/

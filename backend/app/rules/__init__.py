@@ -1,0 +1,1 @@
+"""Substitution decision rules package."""

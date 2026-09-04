@@ -1,0 +1,11 @@
+fastapi==0.115.8
+starlette==0.45.3
+uvicorn==0.34.0
+pydantic==2.10.6
+pytest==8.3.4
+httpx==0.28.1
+sqlalchemy==2.0.52
+psycopg[binary]==3.3.4
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
+alembic==1.19.1
