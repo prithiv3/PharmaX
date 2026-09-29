@@ -6,6 +6,7 @@ from app.repositories import (
     compute_population_fairness_metrics,
 )
 from app.schemas.fairness import (
+    BiasAuditSummary,
     DemographicSegmentMetrics,
     ErrorAnalysisResponse,
     PopulationFairnessResponse,
@@ -15,6 +16,10 @@ from app.schemas.fairness import (
 def get_population_fairness_service(db: Session) -> PopulationFairnessResponse:
     """Service to compute demographic bias and fairness metrics across synthetic populations."""
     raw = compute_population_fairness_metrics(db)
+
+    bias_raw = raw.get("bias_audit_summary", {})
+    bias_summary = BiasAuditSummary(**bias_raw) if bias_raw else None
+
     return PopulationFairnessResponse(
         age_group_metrics=[
             DemographicSegmentMetrics(**m) for m in raw.get("age_group_metrics", [])
@@ -26,6 +31,7 @@ def get_population_fairness_service(db: Session) -> PopulationFairnessResponse:
             DemographicSegmentMetrics(**m)
             for m in raw.get("organ_impairment_metrics", [])
         ],
+        bias_audit_summary=bias_summary,
         fairness_disparity_notes=raw.get("fairness_disparity_notes", []),
     )
 

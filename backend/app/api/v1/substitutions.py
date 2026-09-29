@@ -1,7 +1,9 @@
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
-from app.db.session import get_db
+from app.core.security import capacity_guard, get_authenticated_pharmacist
+from app.db.session import get_db, get_db_with_fallback
 from app.schemas.analytics import AnalyticsSummaryResponse, DecisionListResponse
 from app.schemas.fairness import ErrorAnalysisResponse, PopulationFairnessResponse
 from app.schemas.review import (
@@ -31,17 +33,40 @@ from app.services.substitution_service import (
 router = APIRouter(prefix="/api/v1/substitutions", tags=["Substitutions"])
 
 
+# Shared 503 fallback response body for analytics endpoints when DB is unavailable.
+_DB_UNAVAILABLE_503 = JSONResponse(
+    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+    content={
+        "detail": (
+            "Analytics service is temporarily unavailable: database connection could not "
+            "be established. The system is operating in graceful degradation mode. "
+            "Please retry after the database becomes reachable."
+        )
+    },
+)
+
+
 @router.post(
     "/evaluate",
     response_model=DecisionResult,
     status_code=status.HTTP_200_OK,
     summary="Evaluate pharmacy substitution decision support request",
-    description="Deterministically evaluates patient, clinical, allergy, interaction, dosage, and stock safety constraints for a proposed substitution.",
+    description=(
+        "Deterministically evaluates patient, clinical, allergy, interaction, dosage, and stock "
+        "safety constraints for a proposed substitution. "
+        "Returns HTTP 429 when the concurrent evaluation capacity limit is reached."
+    ),
 )
 def evaluate_substitution(
-    request: SubstitutionRequest, db: Session = Depends(get_db)
+    request: SubstitutionRequest,
+    db: Session = Depends(get_db),
+    _capacity: None = Depends(capacity_guard),
 ) -> DecisionResult:
-    """Evaluate substitution decision request through service layer and decision engine."""
+    """Evaluate substitution decision request through service layer and decision engine.
+
+    The capacity_guard dependency enforces MAX_CONCURRENT_EVALUATIONS from Settings,
+    returning HTTP 429 Too Many Requests if the service is at capacity.
+    """
     try:
         return evaluate_substitution_request_service(db, request)
     except HTTPException:
@@ -137,12 +162,24 @@ def get_analytics_summary(
     response_model=PopulationFairnessResponse,
     status_code=status.HTTP_200_OK,
     summary="Get synthetic population demographic bias and fairness metrics",
-    description="Evaluates decision outcome distributions across age cohorts, gender, and organ impairment demographic segments.",
+    description=(
+        "Evaluates decision outcome distributions across age cohorts, gender, and organ impairment "
+        "demographic segments. Includes baseline block rates, statistical parity gaps, and "
+        "error-rate disparities per cohort. Returns HTTP 503 with a degraded response body "
+        "when the database is unreachable."
+    ),
 )
 def get_population_fairness(
-    db: Session = Depends(get_db)
+    db: Optional[Session] = Depends(get_db_with_fallback),
 ) -> PopulationFairnessResponse:
-    """Retrieve population demographic bias and fairness metrics."""
+    """Retrieve population demographic bias and fairness metrics.
+
+    Uses get_db_with_fallback: if the database is unreachable and
+    ENABLE_GRACEFUL_DB_FALLBACK=True, returns a structured 503 response
+    instead of propagating an unhandled exception.
+    """
+    if db is None:
+        return _DB_UNAVAILABLE_503
     try:
         return get_population_fairness_service(db)
     except HTTPException:
@@ -159,12 +196,23 @@ def get_population_fairness(
     response_model=ErrorAnalysisResponse,
     status_code=status.HTTP_200_OK,
     summary="Get safety audit and error analysis metrics",
-    description="Computes safety block root cause distributions, risk severity breakdowns, and decision confidence averages.",
+    description=(
+        "Computes safety block root cause distributions, risk severity breakdowns, and decision "
+        "confidence averages. Returns HTTP 503 with a degraded response body when the database "
+        "is unreachable."
+    ),
 )
 def get_error_analysis(
-    db: Session = Depends(get_db)
+    db: Optional[Session] = Depends(get_db_with_fallback),
 ) -> ErrorAnalysisResponse:
-    """Retrieve safety audit and error analysis metrics."""
+    """Retrieve safety audit and error analysis metrics.
+
+    Uses get_db_with_fallback: if the database is unreachable and
+    ENABLE_GRACEFUL_DB_FALLBACK=True, returns a structured 503 response
+    instead of propagating an unhandled exception.
+    """
+    if db is None:
+        return _DB_UNAVAILABLE_503
     try:
         return get_error_analysis_service(db)
     except HTTPException:
@@ -198,7 +246,6 @@ def get_substitution_decision(
         ) from exc
 
 
-from app.core.security import get_authenticated_pharmacist
 
 
 @router.post(

@@ -1,8 +1,15 @@
-"""Prototype Security and Pharmacist Authorization Module."""
+"""Prototype Security, Pharmacist Authorization, and Capacity Guard Module."""
 
+import threading
 from typing import Optional
-from fastapi import Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 
+from app.core.config import settings
+
+
+# ---------------------------------------------------------------------------
+# Pharmacist authentication
+# ---------------------------------------------------------------------------
 
 def get_authenticated_pharmacist(
     x_pharmacist_token: Optional[str] = Header(None, alias="X-Pharmacist-Token"),
@@ -29,3 +36,46 @@ def get_authenticated_pharmacist(
         )
 
     return token_str
+
+
+# ---------------------------------------------------------------------------
+# Capacity Guard – concurrent evaluation limiter
+# ---------------------------------------------------------------------------
+
+# Semaphore initialized from the capacity constraint setting.
+# acquire(blocking=False) is used so the thread never blocks;
+# if the slot cannot be acquired immediately, HTTP 429 is returned.
+_evaluation_semaphore = threading.Semaphore(settings.MAX_CONCURRENT_EVALUATIONS)
+
+
+def capacity_guard() -> None:
+    """FastAPI dependency that enforces MAX_CONCURRENT_EVALUATIONS.
+
+    Acquires a slot from the semaphore pool before allowing the evaluation
+    pipeline to proceed. Releases the slot when the request exits (via
+    contextmanager-style try/finally in the route handler).
+
+    Raises HTTP 429 Too Many Requests when all capacity slots are occupied.
+
+    Usage (in route handler):
+        _ = Depends(capacity_guard)
+
+    NOTE: For production use, replace with an async semaphore (asyncio.Semaphore)
+    when the FastAPI app runs with async route handlers. The threading semaphore
+    is correct for synchronous route handlers (the current implementation).
+    """
+    acquired = _evaluation_semaphore.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"Service capacity limit reached "
+                f"({settings.MAX_CONCURRENT_EVALUATIONS} concurrent evaluations). "
+                "Please retry after a short delay."
+            ),
+            headers={"Retry-After": "5"},
+        )
+    try:
+        yield
+    finally:
+        _evaluation_semaphore.release()

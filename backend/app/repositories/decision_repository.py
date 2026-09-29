@@ -220,7 +220,18 @@ def compute_analytics_summary(db: Session) -> dict:
 
 
 def compute_population_fairness_metrics(db: Session) -> dict:
-    """Compute demographic fairness metrics by joining decisions with patient demographic attributes."""
+    """Compute demographic fairness metrics with baseline rates and formal bias reporting.
+
+    Returns per-cohort metrics including:
+    - block_rate, approval_rate, override_rate
+    - baseline_block_rate (population-wide)
+    - statistical_parity_gap  = cohort_block_rate - baseline_block_rate
+    - error_rate_disparity    = cohort_block_rate / baseline_block_rate
+    - max_intra_dimension_gap = max |block_rate_i - block_rate_j| within dimension
+
+    Also returns a bias_audit_summary dict with cross-dimension aggregate statistics
+    and a fairness_threshold_breached flag (|gap| > 0.05).
+    """
     decisions = (
         db.query(SubstitutionDecision, Patient)
         .join(Patient, SubstitutionDecision.patient_id == Patient.id)
@@ -245,11 +256,25 @@ def compute_population_fairness_metrics(db: Session) -> dict:
         "Normal Organ Function": {"total": 0, "rec": 0, "blocked": 0, "override": 0},
     }
 
+    # Population-wide tallies for baseline computation
+    pop_total = 0
+    pop_blocked = 0
+    pop_rec = 0
+    pop_override = 0
+
     for dec, pat in decisions:
         status = dec.decision_status
         is_rec = status in ("RECOMMENDED", "APPROVED")
         is_blocked = status in ("BLOCKED", "REJECTED")
         is_override = status == "OVERRIDDEN" or len(dec.pharmacist_reviews) > 0
+
+        pop_total += 1
+        if is_rec:
+            pop_rec += 1
+        if is_blocked:
+            pop_blocked += 1
+        if is_override:
+            pop_override += 1
 
         # Age cohort
         age = getattr(pat, "age", 0) or 0
@@ -317,32 +342,137 @@ def compute_population_fairness_metrics(db: Session) -> dict:
             if is_override:
                 organ_cohorts["Normal Organ Function"]["override"] += 1
 
-    def _format_list(cohort_dict):
-        result = []
+    # -----------------------------------------------------------------------
+    # Baseline population metrics
+    # -----------------------------------------------------------------------
+    baseline_block_rate = round(pop_blocked / pop_total, 4) if pop_total > 0 else 0.0
+    baseline_approval_rate = round(pop_rec / pop_total, 4) if pop_total > 0 else 0.0
+    baseline_override_rate = round(pop_override / pop_total, 4) if pop_total > 0 else 0.0
+
+    # -----------------------------------------------------------------------
+    # Helper: build formatted list with disparity metrics
+    # -----------------------------------------------------------------------
+    def _format_list_with_disparity(cohort_dict: dict) -> list:
+        """Compute per-segment rates, parity gaps, and error-rate disparities."""
+        entries = []
         for name, data in cohort_dict.items():
             tot = data["total"]
             br = round(data["blocked"] / tot, 4) if tot > 0 else 0.0
-            result.append(
+            ar = round(data["rec"] / tot, 4) if tot > 0 else 0.0
+            orr = round(data["override"] / tot, 4) if tot > 0 else 0.0
+
+            gap = round(br - baseline_block_rate, 4) if tot > 0 else None
+            erd = (
+                round(br / baseline_block_rate, 4)
+                if (tot > 0 and baseline_block_rate > 0)
+                else None
+            )
+            entries.append(
                 {
                     "segment_name": name,
                     "total_evaluations": tot,
                     "recommended_count": data["rec"],
                     "blocked_count": data["blocked"],
-                    "block_rate": br,
                     "override_count": data["override"],
+                    "block_rate": br,
+                    "approval_rate": ar,
+                    "override_rate": orr,
+                    "baseline_block_rate": baseline_block_rate,
+                    "statistical_parity_gap": gap,
+                    "error_rate_disparity": erd,
+                    # filled in after loop
+                    "max_intra_dimension_gap": None,
                 }
             )
-        return result
+
+        # Compute max_intra_dimension_gap for each entry within this dimension
+        block_rates = [e["block_rate"] for e in entries]
+        for entry in entries:
+            gaps = [abs(entry["block_rate"] - other_br) for other_br in block_rates]
+            entry["max_intra_dimension_gap"] = round(max(gaps), 4) if gaps else None
+
+        return entries
+
+    # -----------------------------------------------------------------------
+    # Format all three dimensions
+    # -----------------------------------------------------------------------
+    age_list = _format_list_with_disparity(age_cohorts)
+    gender_list = _format_list_with_disparity(gender_cohorts)
+    organ_list = _format_list_with_disparity(organ_cohorts)
+
+    # -----------------------------------------------------------------------
+    # Bias audit summary – cross-dimension aggregates
+    # -----------------------------------------------------------------------
+    FAIRNESS_THRESHOLD = 0.05
+
+    def _max_abs_gap(fmt_list: list) -> float:
+        gaps = [abs(e["statistical_parity_gap"]) for e in fmt_list if e["statistical_parity_gap"] is not None]
+        return round(max(gaps), 4) if gaps else 0.0
+
+    def _max_erd(fmt_list: list):
+        erds = [e["error_rate_disparity"] for e in fmt_list if e["error_rate_disparity"] is not None]
+        return round(max(erds), 4) if erds else None
+
+    max_age_gap = _max_abs_gap(age_list)
+    max_gender_gap = _max_abs_gap(gender_list)
+    max_organ_gap = _max_abs_gap(organ_list)
+
+    breached_segments = [
+        e["segment_name"]
+        for dimension in (age_list, gender_list, organ_list)
+        for e in dimension
+        if e["statistical_parity_gap"] is not None
+        and abs(e["statistical_parity_gap"]) > FAIRNESS_THRESHOLD
+    ]
+
+    bias_audit_summary = {
+        "population_baseline_block_rate": baseline_block_rate,
+        "population_baseline_approval_rate": baseline_approval_rate,
+        "population_baseline_override_rate": baseline_override_rate,
+        "max_age_parity_gap": max_age_gap,
+        "max_gender_parity_gap": max_gender_gap,
+        "max_organ_parity_gap": max_organ_gap,
+        "max_age_error_rate_disparity": _max_erd(age_list),
+        "max_gender_error_rate_disparity": _max_erd(gender_list),
+        "max_organ_error_rate_disparity": _max_erd(organ_list),
+        "fairness_threshold_breached": len(breached_segments) > 0,
+        "breached_segments": breached_segments,
+    }
+
+    # -----------------------------------------------------------------------
+    # Disparity notes – enriched with quantitative observations
+    # -----------------------------------------------------------------------
+    disparity_notes = [
+        "Deterministic safety rules apply objectively based on clinical contraindications.",
+        (
+            f"Population baseline block rate: {baseline_block_rate:.1%} | "
+            f"approval rate: {baseline_approval_rate:.1%} | "
+            f"override rate: {baseline_override_rate:.1%}."
+        ),
+        (
+            f"Max age-dimension statistical parity gap: {max_age_gap:.4f} "
+            f"({'THRESHOLD BREACHED' if max_age_gap > FAIRNESS_THRESHOLD else 'within threshold'})."
+        ),
+        (
+            f"Max gender-dimension statistical parity gap: {max_gender_gap:.4f} "
+            f"({'THRESHOLD BREACHED' if max_gender_gap > FAIRNESS_THRESHOLD else 'within threshold'})."
+        ),
+        (
+            f"Max organ-dimension statistical parity gap: {max_organ_gap:.4f} "
+            f"({'THRESHOLD BREACHED' if max_organ_gap > FAIRNESS_THRESHOLD else 'within threshold'})."
+        ),
+        "Higher block rates in geriatric and organ-impaired cohorts accurately reflect clinical safety bounds.",
+        "All metrics computed on synthetic seed data; clinical validation on real patient datasets is required before production deployment.",
+    ]
 
     return {
-        "age_group_metrics": _format_list(age_cohorts),
-        "gender_metrics": _format_list(gender_cohorts),
-        "organ_impairment_metrics": _format_list(organ_cohorts),
-        "fairness_disparity_notes": [
-            "Deterministic safety rules apply objectively based on clinical contraindications.",
-            "Higher block rates in geriatric and renal impairment cohorts accurately reflect clinical safety bounds.",
-        ],
+        "age_group_metrics": age_list,
+        "gender_metrics": gender_list,
+        "organ_impairment_metrics": organ_list,
+        "bias_audit_summary": bias_audit_summary,
+        "fairness_disparity_notes": disparity_notes,
     }
+
 
 
 def compute_error_analysis_metrics(db: Session) -> dict:
