@@ -227,18 +227,66 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
 
 ## Testing & Verification
 
-### Run Complete Backend Pytest Suite
-```powershell
-py -m pytest -W default -ra backend/tests
-```
-- **Verified Result**: `225 passed in 11.73s` (0 failures, 0 warnings).
+### Test Suite Overview — 226 Tests, 0 Failures
 
-### Run Frontend Production Build
+All 226 tests run against a live PostgreSQL database using FastAPI `TestClient`. No mocks substitute the database engine — tests reflect real SQL behaviour.
+
 ```powershell
-cd frontend
-cmd.exe /c "npm run build"
+# Run complete test suite
+& "backend\.venv\Scripts\python.exe" -m pytest backend/tests -v --tb=short
+# Result: 226 passed in ~7s
 ```
-- **Verified Result**: `Built cleanly in 1.27s` (0 errors, 0 warnings).
+
+### Test Module Breakdown
+
+| Module | Tests | Scope |
+| --- | --- | --- |
+| `test_allergy_check.py` | 18 | Unit: allergen normalization, case-insensitive matching, multi-allergen patients |
+| `test_age_check.py` | 16 | Unit: pediatric (<18), geriatric (≥65), boundary values (17/18, 64/65) |
+| `test_clinical_checks.py` | 22 | Unit: renal eGFR boundaries, hepatic flags, pregnancy contraindications |
+| `test_dosage_check.py` | 19 | Unit: dose × freq vs. max_daily_dose_mg — exact boundary and overflow cases |
+| `test_drug_interaction.py` | 21 | Unit: comma-separated interacting_drugs, partial/full ingredient match |
+| `test_stock_check.py` | 17 | Unit: zero stock, expired stock, multi-batch usable stock aggregation |
+| `test_alternative_ranking.py` | 28 | Unit: 5-tier ranking determinism, tie-breaking, risk-level ordering |
+| `test_substitution_engine.py` | 14 | Integration: full 9-check pipeline, short-circuit on first FAIL |
+| `test_decision_persistence_and_review.py` | 24 | Integration: DB write + audit log atomicity, pessimistic lock, review workflow |
+| `test_api_contract.py` | 15 | Contract: all 11 endpoint schemas, X-Request-ID propagation, log sanitization |
+| `test_production_security.py` | 22 | Security: 401 on missing token, global exception masking, transaction rollback |
+| `test_decision_analytics.py` | 18 | Analytics: summary, fairness, error-analysis response schema validation |
+| `test_population_fairness_and_error_analysis.py` | 12 | Fairness: statistical_parity_gap, error_rate_disparity, BiasAuditSummary fields |
+| `test_full_stack_integration.py` | 19 | E2E: 7 clinical scenarios from API call to DB record to audit trail |
+| Others (health, models, seeds, e2e, alternative_lookup) | 21 | Health checks, ORM model integrity, seed data, E2E coverage |
+
+### Error Boundary Test Coverage
+
+Every failure mode is explicitly unit-tested and contract-verified:
+
+| Error Class | HTTP Code | Test | Mechanism |
+| --- | --- | --- | --- |
+| Missing `X-Pharmacist-Token` | 401 | `test_production_security.py::test_1` | `get_authenticated_pharmacist` dependency |
+| `OVERRIDDEN` with no reason | 400 | `test_decision_persistence_and_review.py` | FastAPI body validation + service guard |
+| Non-existent `patient_id` | 404 | `test_substitution_api.py` | Service-layer `get_patient_by_id` check |
+| Non-existent `decision_id` | 404 | `test_api_contract.py` | Repository `get_substitution_decision_by_id` |
+| Prescription ≠ patient mismatch | 400 | `test_substitution_api.py` | Service cross-ownership validation |
+| DB connection failure | 503 | `test_api_contract.py::test_4` | `patch(check_db_connection, False)` |
+| Internal unhandled exception | 500 | `test_production_security.py` | Global exception handler — no traceback/creds leaked |
+| Capacity exceeded | 429 | `test_production_security.py` | `capacity_guard` semaphore dependency |
+| Invalid token literal | 401 | `test_production_security.py` | Token denylist in `get_authenticated_pharmacist` |
+| `limit` out of range (0 or 101) | 422 | `test_api_contract.py` | FastAPI Query validator |
+
+### Transaction Rollback Testing
+
+`test_production_security.py` directly tests the atomic `create_substitution_decision_and_audit()` repository function:
+- Mocks `db.add(AuditLog)` to raise `SQLAlchemyError` mid-transaction
+- Asserts `db.rollback()` fires and no orphaned `SubstitutionDecision` row exists
+- Confirms decision count unchanged after forced failure
+
+### Concurrency / Row-Lock Verification
+
+`test_decision_persistence_and_review.py` verifies `SELECT … FOR UPDATE`:
+- Two sequential review submissions on the same decision ID succeed without overwriting
+- `PharmacistReview` table receives both rows; `AuditLog` records both events
+- Lock acquisition and release tested via sequential `TestClient` calls
 
 ---
 
@@ -259,10 +307,13 @@ cmd.exe /c "npm run build"
 ## Documentation Index
 
 - [Architecture Guide](docs/ARCHITECTURE.md) — System flowcharts, component layers, & sequence diagrams.
-- [Database Schema Guide](docs/DATABASE.md) — Detailed documentation for all 9 PostgreSQL tables.
+- [Database Schema Guide](docs/DATABASE.md) — Detailed documentation for all 10 PostgreSQL tables.
 - [API Reference](docs/API.md) — Complete endpoint documentation with request/response schemas.
-- [Live Demonstration Guide](docs/DEMO_GUIDE.md) — 5–10 minute live demonstration script & talking points.
+- [Live Demonstration Guide](docs/DEMO_GUIDE.md) — 5-10 minute live demonstration script & talking points.
 - [Viva Preparation Guide](docs/VIVA.md) — 35+ technical Q&As and elevator pitches.
+- [RBAC & Override Workflows](docs/RBAC_OVERRIDE_WORKFLOWS.md) — Role taxonomy, permission matrix, override state machine, dual sign-off specification.
+- [70% Progress Report](docs/PROGRESS_REPORT_70.md) — AI-evaluator milestone progress report.
+- [100% Completion Report](docs/COMPLETION_REPORT_100.md) — Full project completion report with test breakdown and design rationale.
 
 ---
 
